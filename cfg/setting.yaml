@@ -4,4 +4,42 @@ logs_path: "./logs/"
 checkpoints_path: './checkpoints/'
 saved_models: './saved_models'
 
-
+exp_name: 1
+secret_size: 20
+num_steps: 140000
+batch_size: 4
+lr': 0.0001
+l2_loss_scale: 1.5
+l2_loss_ramp: 20000
+l2_edge_gain: 10.0
+l2_edge_ramp: 20000
+l2_edge_delay: 60000
+lpips_loss_scale: 1
+lpips_loss_ramp: 20000
+secret_loss_scale: 1
+secret_loss_ramp: 1
+G_loss_scale: 1
+G_loss_ramp: 20000
+borders: 'black' # choices=['no_edge','black','random','randomrgb','image','white']
+y_scale: 1.0
+u_scale: 1.0
+v_scale: 1.0
+no_gan: True
+rnd_trans: 0.1
+rnd_bri: 0.3
+rnd_noise: 0.02
+rnd_sat: 1.0
+rnd_hue: 0.1
+contrast_low: 0.5
+contrast_high: 1.5
+jpeg_quality: 25
+no_jpeg: True
+rnd_trans_ramp: 10000
+rnd_bri_ramp: 1000
+rnd_sat_ramp: 1000
+rnd_hue_ramp: 1000
+rnd_noise_ramp: 1000
+contrast_ramp: 1000
+jpeg_quality_ramp: 1000
+no_im_loss_steps: 500
+pretrained: None
