@@ -140,6 +140,11 @@ def transform_net(encoded_image, args, global_step):
     jpeg_quality = 100. - torch.Tensor(1).uniform_(0, 1) * ramp_fn(args.jpeg_quality_ramp) * (100. - args.jpeg_quality)
     jpeg_factor = 
 
+
+
+
+    
+
     rnd_noise = 
 
     contrast_low = 1. - (1. - args.contrast_low) * ramp_fn(args.contrast_ramp)
@@ -228,4 +233,3 @@ def build_model(encoder, decoder, discriminator, secret_input, image_input, l2_e
         loss += loss_scales[3] * G_loss
     
     return los, secret_loss, D_loss
-    

@@ -3,6 +3,7 @@ import itertools
 import numpy as np
 import random
 import torch
+import torch.nn.functional as F
 
 import tensorflow as tf
 
@@ -86,46 +87,38 @@ def get_rnd_brightness_tf(rnd_bri, rnd_hue, batch_size):
 
 # 1. RGB -> YCbCr
 # https://en.wikipedia.org/wiki/YCbCr
-def rgb_to_ycbcr(image):
-  matrix = np.array(
+def rgb_to_ycbcr(image): # image [3, h, w]
+  matrix = torch.FloatTensor(
       [[65.481, 128.553, 24.966], [-37.797, -74.203, 112.],
-       [112., -93.786, -18.214]],
-      dtype=np.float32).T / 255
-  shift = [16., 128., 128.]
-
-  result = tf.tensordot(image, matrix, axes=1) + shift
-  result.set_shape(image.shape.as_list())
+       [112., -93.786, -18.214]]) / 255
+  shift = torch.FloatTensor([16., 128., 128.]).reshape(3, 1, 1)
+  # reference: https://stackoverflow.com/questions/50791316/dot-product-of-tensors-with-different-shapes-in-pytorch
+  result = torch.einsum("ab, bcd->acd", matrix, image) + shift
   return result
 
 
 def rgb_to_ycbcr_jpeg(image):
-  matrix = np.array(
+  matrix = torch.FloatTensor(
       [[0.299, 0.587, 0.114], [-0.168736, -0.331264, 0.5],
-       [0.5, -0.418688, -0.081312]],
-      dtype=np.float32).T
-  shift = [0., 128., 128.]
-
-  result = tf.tensordot(image, matrix, axes=1) + shift
-  result.set_shape(image.shape.as_list())
+       [0.5, -0.418688, -0.081312]])
+  shift = torch.FloatTensor([0., 128., 128.]).reshape(3, 1, 1)
+  # reference: https://stackoverflow.com/questions/50791316/dot-product-of-tensors-with-different-shapes-in-pytorch
+  result = torch.einsum("ab, bcd->acd", matrix, image) + shift
   return result
 
 
 # 2. Chroma subsampling
 def downsampling_420(image):
-  # input: batch x height x width x 3
+  # input: batch x 3 x height x width
   # output: tuple of length 3
   #   y:  batch x height x width
   #   cb: batch x height/2 x width/2
   #   cr: batch x height/2 x width/2
-  y, cb, cr = tf.split(image, 3, axis=3)
-  cb = tf.nn.avg_pool(
-      cb, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
-  cr = tf.nn.avg_pool(
-      cr, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
-  return (tf.squeeze(
-      y, axis=-1), tf.squeeze(
-          cb, axis=-1), tf.squeeze(
-              cr, axis=-1))
+  y, cb, cr = torch.chunk(image, 3, dim=1)
+  F.avg_pool2d()
+  cb = tf.nn.avg_pool(cb, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
+  cr = tf.nn.avg_pool(cr, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
+  return (y.squeeze_(1), cb.squeeze_(1), cr.squeeze_(1))
 
 
 # 3. Block splitting
@@ -134,11 +127,11 @@ def image_to_patches(image):
   # input: batch x h x w
   # output: batch x h*w/64 x h x w
   k = 8
-  height, width = image.shape.as_list()[1:3]
-  batch_size = tf.shape(image)[0]
-  image_reshaped = tf.reshape(image, [batch_size, height // k, k, -1, k])
-  image_transposed = tf.transpose(image_reshaped, [0, 1, 3, 2, 4])
-  return tf.reshape(image_transposed, [batch_size, -1, k, k])
+  height, width = image.shape[1:3]
+  batch_size = image.shape[0]
+  image_reshaped = image.reshape([batch_size, height // k, k, -1, k])
+  image_transposed = image_reshaped.permute([0, 1, 3, 2, 4])
+  return image_transposed.reshape([batch_size, -1, k, k])
 
 
 # 4. DCT
@@ -164,6 +157,7 @@ def dct_8x8(image):
         (2 * y + 1) * v * np.pi / 16)
   alpha = np.array([1. / np.sqrt(2)] + [1] * 7)
   scale = np.outer(alpha, alpha) * 0.25
+
   result = scale * tf.tensordot(image, tensor, axes=2)
   result.set_shape(image.shape.as_list())
   return result
@@ -300,8 +294,8 @@ def jpeg_compress_decompress(image,
                              downsample_c=True,
                              rounding=diff_round,
                              factor=1):
-  image *= 255
-  height, width = image.shape.as_list()[1:3]
+  image *= 255        # b x c x h x w
+  height, width = image.shape[2:4]
   orig_height, orig_width = height, width
   if height % 16 != 0 or width % 16 != 0:
     # Round up to next multiple of 16
