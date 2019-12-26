@@ -1,0 +1,7 @@
+
+train_path: './data/mirflickr/images1/images/'
+logs_path: "./logs/"
+checkpoints_path: './checkpoints/'
+saved_models: './saved_models'
+
+
