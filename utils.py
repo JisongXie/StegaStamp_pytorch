@@ -4,49 +4,52 @@ import numpy as np
 import random
 import torch
 import torch.nn.functional as F
-
 import torch.nn as nn
-# Local
-import utils
 
+from PIL import Image, ImageOps
+import matplotlib.pyplot as plt
 
 def random_blur_kernel(probs, N_blur, sigrange_gauss, sigrange_line, wmin_line):
     N = N_blur
-    
-    coords = tf.to_float(tf.stack(tf.meshgrid(tf.range(N_blur), tf.range(N_blur), indexing='ij'), -1)) - (.5 * (N-1))
-    # coords = tf.to_float(coords)
-    manhat = tf.reduce_sum(tf.abs(coords), -1)
+    coords = torch.from_numpy(np.stack(np.meshgrid(range(N_blur), range(N_blur), indexing='ij'), axis=-1)) - (0.5 * (N-1)) # （7,7,2)
+    manhat = torch.sum(torch.abs(coords), dim=-1)   # (7, 7)
 
     # nothing, default
-    vals_nothing = tf.to_float(manhat < .5)
+    vals_nothing = (manhat < 0.5).float()           # (7, 7)
 
     # gauss
-    sig_gauss = tf.random.uniform([], sigrange_gauss[0], sigrange_gauss[1])
-    vals_gauss = tf.exp(-tf.reduce_sum(coords**2, -1)/2./sig_gauss**2)
+    sig_gauss = torch.rand(1)[0] * (sigrange_gauss[1] - sigrange_gauss[0]) + sigrange_gauss[0]
+    vals_gauss = torch.exp(-torch.sum(coords ** 2, dim=-1) /2. / sig_gauss ** 2)
 
     # line
-    theta = tf.random_uniform([], 0, 2.*np.pi)
-    v = tf.convert_to_tensor([tf.cos(theta), tf.sin(theta)])
-    dists = tf.reduce_sum(coords * v, -1)
+    theta = torch.rand(1)[0] * 2.* np.pi
+    v = torch.FloatTensor([torch.cos(theta), torch.sin(theta)]) # (2)
+    dists = torch.sum(coords * v, dim=-1)                       # (7, 7)
 
-    sig_line = tf.random.uniform([], sigrange_line[0], sigrange_line[1])
-    w_line = tf.random.uniform([], wmin_line, .5 * (N-1) + .1)
+    sig_line = torch.rand(1)[0] * (sigrange_line[1] - sigrange_line[0]) + sigrange_line[0]
+    w_line = torch.rand(1)[0] * (0.5 * (N-1) + 0.1 - wmin_line) + wmin_line
 
-    vals_line = tf.exp(-dists**2/2./sig_line**2) * tf.to_float(manhat < w_line)
+    vals_line = torch.exp(-dists ** 2 / 2. / sig_line ** 2) * (manhat < w_line) # (7, 7)
 
-    t = tf.random_uniform([])
+    t = torch.rand(1)[0]
     vals = vals_nothing
-    vals = tf.cond(t < probs[0]+probs[1], lambda : vals_line, lambda : vals)
-    vals = tf.cond(t < probs[0], lambda : vals_gauss, lambda : vals)
+    if t < (probs[0] + probs[1]):
+        vals = vals_line
+    else:
+        vals = vals
+    if t < probs[0]:
+        vals = vals_gauss
+    else:
+        vals = vals
 
-    v = vals / tf.reduce_sum(vals)
-    z = tf.zeros_like(v)
-    f = tf.reshape(tf.stack([v,z,z, z,v,z, z,z,v],-1), [N,N,3,3])
-
+    v = vals / torch.sum(vals)      # 归一化 (7, 7)
+    z = torch.zeros_like(v)     
+    f = torch.stack([v,z,z, z,v,z, z,z,v], dim=0).reshape([3, 3, N, N])
     return f
 
 
 def get_rand_transform_matrix(image_size, d, batch_size):
+    Ms = np.zeros((batch_size, 2, 3, 3))
     for i in range(batch_size):
         tl_x = random.uniform(-d, d)     # Top left corner, top
         tl_y = random.uniform(-d, d)    # Top left corner, left
@@ -57,27 +60,49 @@ def get_rand_transform_matrix(image_size, d, batch_size):
         br_x = random.uniform(-d, d)  # Bot right corner, bot
         br_y = random.uniform(-d, d)   # Bot right corner, right
 
-        rect = [
-            (tl_x, tl_y),
-            (tr_x + image_size, tr_y),
-            (br_x + image_size, br_y + image_size),
-            (bl_x, bl_y + image_size)]
+        rect = np.array([
+            [tl_x, tl_y],
+            [tr_x + image_size, tr_y],
+            [br_x + image_size, br_y + image_size],
+            [bl_x, bl_y +  image_size]], dtype = "float32")
 
-        dst = [
-            (0, 0),
-            (image_size, 0),
-            (image_size, image_size),
-            (0, image_size)]
-    return dst, rect
+        dst = np.array([
+            [0, 0],
+            [image_size, 0],
+            [image_size, image_size],
+            [0, image_size]], dtype = "float32")
+        
+        M = cv2.getPerspectiveTransform(rect, dst)
+        M_inv = np.linalg.inv(M)
+        Ms[i, 0, :, :] = M_inv
+        Ms[i, 1, :, :] = M
+    Ms = torch.from_numpy(Ms).float()
+
+    return Ms
     
 
-def get_rnd_brightness_tf(rnd_bri, rnd_hue, batch_size):
+def get_rnd_brightness_torch(rnd_bri, rnd_hue, batch_size):
     rnd_hue = torch.FloatTensor(batch_size, 3, 1, 1).uniform_(-rnd_hue, rnd_hue)
     rnd_brightness = torch.FloatTensor(batch_size, 1, 1, 1).uniform_(-rnd_bri, rnd_bri)
     return rnd_hue + rnd_brightness
 
 
 # reference: https://github.com/mlomnitz/DiffJPEG.git
+y_table = np.array(
+    [[16, 11, 10, 16, 24, 40, 51, 61], [12, 12, 14, 19, 26, 58, 60,
+                                        55], [14, 13, 16, 24, 40, 57, 69, 56],
+     [14, 17, 22, 29, 51, 87, 80, 62], [18, 22, 37, 56, 68, 109, 103,
+                                        77], [24, 35, 55, 64, 81, 104, 113, 92],
+     [49, 64, 78, 87, 103, 121, 120, 101], [72, 92, 95, 98, 112, 100, 103, 99]],
+    dtype=np.float32).T
+
+y_table = nn.Parameter(torch.from_numpy(y_table))
+c_table = np.empty((8, 8), dtype=np.float32)
+c_table.fill(99)
+c_table[:4, :4] = np.array([[17, 18, 24, 47], [18, 21, 26, 66],
+                            [24, 26, 56, 99], [47, 66, 99, 99]]).T
+c_table = nn.Parameter(torch.from_numpy(c_table))
+
 # 1. RGB -> YCbCr
 class rgb_to_ycbcr_jpeg(nn.Module):
     """ Converts RGB image to YCbCr
@@ -92,13 +117,11 @@ class rgb_to_ycbcr_jpeg(nn.Module):
             [[0.299, 0.587, 0.114], [-0.168736, -0.331264, 0.5],
              [0.5, -0.418688, -0.081312]], dtype=np.float32).T
         self.shift = nn.Parameter(torch.tensor([0., 128., 128.]))
-        #
         self.matrix = nn.Parameter(torch.from_numpy(matrix))
 
     def forward(self, image):
         image = image.permute(0, 2, 3, 1)
         result = torch.tensordot(image, self.matrix, dims=1) + self.shift
-    #    result = torch.from_numpy(result)
         result.view(image.shape)
         return result
 
@@ -183,7 +206,7 @@ class y_quantize(nn.Module):
         super(y_quantize, self).__init__()
         self.rounding = rounding
         self.factor = factor
-        self.y_table = utils.y_table
+        self.y_table = y_table
 
     def forward(self, image):
         image = image.float() / (self.y_table * self.factor)
@@ -204,7 +227,7 @@ class c_quantize(nn.Module):
         super(c_quantize, self).__init__()
         self.rounding = rounding
         self.factor = factor
-        self.c_table = utils.c_table
+        self.c_table = c_table
 
     def forward(self, image):
         image = image.float() / (self.c_table * self.factor)
@@ -259,7 +282,7 @@ class y_dequantize(nn.Module):
     """
     def __init__(self, factor=1):
         super(y_dequantize, self).__init__()
-        self.y_table = utils.y_table
+        self.y_table = y_table
         self.factor = factor
 
     def forward(self, image):
@@ -277,7 +300,7 @@ class c_dequantize(nn.Module):
     def __init__(self, factor=1):
         super(c_dequantize, self).__init__()
         self.factor = factor
-        self.c_table = utils.c_table
+        self.c_table = c_table
 
     def forward(self, image):
         return image * (self.c_table * self.factor)
@@ -371,7 +394,6 @@ class ycbcr_to_rgb_jpeg(nn.Module):
 
     def forward(self, image):
         result = torch.tensordot(image + self.shift, self.matrix, dims=1)
-        #result = torch.from_numpy(result)
         result.view(image.shape)
         return result.permute(0, 3, 1, 2)
 
@@ -415,54 +437,6 @@ class decompress_jpeg(nn.Module):
                           torch.max(torch.zeros_like(image), image))
         return image/255
 
-y_table = np.array(
-    [[16, 11, 10, 16, 24, 40, 51, 61], [12, 12, 14, 19, 26, 58, 60,
-                                        55], [14, 13, 16, 24, 40, 57, 69, 56],
-     [14, 17, 22, 29, 51, 87, 80, 62], [18, 22, 37, 56, 68, 109, 103,
-                                        77], [24, 35, 55, 64, 81, 104, 113, 92],
-     [49, 64, 78, 87, 103, 121, 120, 101], [72, 92, 95, 98, 112, 100, 103, 99]],
-    dtype=np.float32).T
-
-y_table = nn.Parameter(torch.from_numpy(y_table))
-#
-c_table = np.empty((8, 8), dtype=np.float32)
-c_table.fill(99)
-c_table[:4, :4] = np.array([[17, 18, 24, 47], [18, 21, 26, 66],
-                            [24, 26, 56, 99], [47, 66, 99, 99]]).T
-c_table = nn.Parameter(torch.from_numpy(c_table))
-
-
-def jpeg_compress_decompress(image,
-                             downsample_c=True,
-                             rounding=diff_round,
-                             factor=1):
-    image *= 255
-    height, width = image.shape.as_list()[1:3]
-    orig_height, orig_width = height, width
-    if height % 16 != 0 or width % 16 != 0:
-      # Round up to next multiple of 16
-      height = ((height - 1) // 16 + 1) * 16
-      width = ((width - 1) // 16 + 1) * 16
-
-      vpad = height - orig_height
-      wpad = width - orig_width
-      top = vpad // 2
-      bottom = vpad - top
-      left = wpad // 2
-      right = wpad - left
-
-      #image = tf.pad(image, [[0, 0], [top, bottom], [left, right], [0, 0]], 'SYMMETRIC')
-      image = tf.pad(image, [[0, 0], [0, vpad], [0, wpad], [0, 0]], 'SYMMETRIC')
-
-      factor = quality_to_factor(quality)
-      self.compress = compress_jpeg(rounding=rounding, factor=factor)
-      self.decompress = decompress_jpeg(height, width, rounding=rounding,
-                                          factor=factor)
-      y, cb, cr = self.compress(x)
-      recovered = self.decompress(y, cb, cr)
-
-
-
 def diff_round(x):
     """ Differentiable rounding function
     Input:
@@ -472,6 +446,9 @@ def diff_round(x):
     """
     return torch.round(x) + (x - torch.round(x))**3
 
+def round_only_at_0(x):
+    cond = (torch.abs(x) < 0.5).float()
+    return cond * (x ** 3) + (1 - cond) * x
 
 def quality_to_factor(quality):
     """ Calculate factor corresponding to quality
@@ -485,4 +462,78 @@ def quality_to_factor(quality):
     else:
         quality = 200. - quality*2
     return quality / 100.
-  
+
+def jpeg_compress_decompress(image,
+                            #  downsample_c=True,
+                             rounding=round_only_at_0,
+                             quality=80):
+    # image_r = image * 255
+    height, width = image.shape[2:4]
+    # orig_height, orig_width = height, width
+    # if height % 16 != 0 or width % 16 != 0:
+    #     # Round up to next multiple of 16
+    #     height = ((height - 1) // 16 + 1) * 16
+    #     width = ((width - 1) // 16 + 1) * 16
+
+    #     vpad = height - orig_height
+    #     wpad = width - orig_width
+    #     top = vpad // 2
+    #     bottom = vpad - top
+    #     left = wpad // 2
+    #     right = wpad - left
+    # #image = tf.pad(image, [[0, 0], [top, bottom], [left, right], [0, 0]], 'SYMMETRIC')
+    # image = torch.pad(image, [[0, 0], [0, vpad], [0, wpad], [0, 0]], 'reflect')
+
+    factor = quality_to_factor(quality)
+
+    compress = compress_jpeg(rounding=rounding, factor=factor)
+    decompress = decompress_jpeg(height, width, rounding=rounding, factor=factor)
+
+    y, cb, cr = compress(image)
+    recovered = decompress(y, cb, cr)
+
+    return recovered
+
+
+if __name__ == '__main__':
+    ''' test JPEG compress and decompress'''
+    # img = Image.open('house.jpg')
+    # img = np.array(img) / 255.
+    # img_r = np.transpose(img, [2, 0, 1])
+    # img_tensor = torch.from_numpy(img_r).unsqueeze(0).float()
+   
+    # recover = jpeg_compress_decompress(img_tensor)
+
+    # recover_arr = recover.detach().squeeze(0).numpy()
+    # recover_arr = np.transpose(recover_arr, [1, 2, 0])
+
+    # plt.subplot(121)
+    # plt.imshow(img)
+    # plt.subplot(122)
+    # plt.imshow(recover_arr)
+    # plt.show()
+
+    ''' test blur '''
+    # blur
+
+    img = Image.open('house.jpg')
+    img = np.array(img) / 255.
+    img_r = np.transpose(img, [2, 0, 1])
+    img_tensor = torch.from_numpy(img_r).unsqueeze(0).float()
+    print(img_tensor.shape)
+
+    N_blur=7
+    f = random_blur_kernel(probs=[.25, .25], N_blur=N_blur, sigrange_gauss=[1., 3.], sigrange_line=[.25, 1.], wmin_line=3)
+    # print(f.shape)
+    # print(type(f))
+    encoded_image = F.conv2d(img_tensor, f, bias=None, padding=int((N_blur-1)/2))
+
+    encoded_image = encoded_image.detach().squeeze(0).numpy()
+    encoded_image = np.transpose(encoded_image, [1, 2, 0])
+
+    plt.subplot(121)
+    plt.imshow(img)
+    plt.subplot(122)
+    plt.imshow(encoded_image)
+    plt.show()
+

@@ -1,12 +1,16 @@
+import sys
+sys.path.append("PerceptualSimilarity\\")
 import os
 import utils
-import numpy as np
-
 import torch
+import numpy as np
 from torch import nn
+import torchgeometry
+from kornia import color
 import torch.nn.functional as F
 from torchvision import transforms
-import pytorch_colors as colors
+from PerceptualSimilarity.lpips_torch import lpips
+
 
 class Dense(nn.Module):
     def __init__(self, in_features, out_features, activation='relu', kernel_initializer='he_normal'):
@@ -80,7 +84,6 @@ class StegaStampEncoder(nn.Module):
         image = image - .5
 
         secrect = self.secret_dense(secrect)
-        print(secrect.shape)
         secrect = secrect.reshape(-1, 3, 50, 50)
         secrect_enlarged = nn.Upsample(scale_factor=(8, 8))(secrect)
 
@@ -105,12 +108,14 @@ class StegaStampEncoder(nn.Module):
         residual = self.residual(conv9)
         return residual
 
+
 class Flatten(nn.Module):
     def __init__(self):
         super(Flatten, self).__init__()
 
     def forward(self, input):
         return input.view(input.size(0), -1)
+
 
 class StegaStampDecoder(nn.Module):
     def __init__(self, secret_size=100):
@@ -130,7 +135,8 @@ class StegaStampDecoder(nn.Module):
 
     def forward(self, image):
         image = image - .5
-        return self.decoder(image)
+        return torch.sigmoid(self.decoder(image))
+
 
 class Discriminator(nn.Module):
     def __init__(self):
@@ -147,93 +153,111 @@ class Discriminator(nn.Module):
         x = self.model(x)
         output = torch.mean(x)
         return output, x
-    
+
+
 def transform_net(encoded_image, args, global_step):
     sh = encoded_image.size()
-
     ramp_fn = lambda ramp: np.min([global_step / ramp, 1.])
 
     rnd_bri = ramp_fn(args.rnd_bri_ramp) * args.rnd_bri
     rnd_hue = ramp_fn(args.rnd_hue_ramp) * args.rnd_hue
-    rnd_brightness = utils.get_rnd_brightness_torch(rnd_bri, rnd_hue, args.batch_size)
-
-    jpeg_quality = 100. - torch.Tensor(1).uniform_(0, 1) * ramp_fn(args.jpeg_quality_ramp) * (100. - args.jpeg_quality)
-    if jpeg_quality < 50:
-        jpeg_factor = (lambda: 5000. / jpeg_quality) / 100. + .0001
-    else:
-        jpeg_factor = (lambda: 200. - jpeg_quality * 2) / 100. + .0001
-
-    rnd_noise = torch.rand() * ramp_fn(args.rnd_noise_ramp) * args.rnd_noise
+    rnd_brightness = utils.get_rnd_brightness_torch(rnd_bri, rnd_hue, args.batch_size)  # [batch_size, 3, 1, 1]
+    jpeg_quality = 100. - torch.rand(1)[0] * ramp_fn(args.jpeg_quality_ramp) * (100. - args.jpeg_quality)
+    rnd_noise = torch.rand(1)[0] * ramp_fn(args.rnd_noise_ramp) * args.rnd_noise
 
     contrast_low = 1. - (1. - args.contrast_low) * ramp_fn(args.contrast_ramp)
     contrast_high = 1. + (args.contrast_high -  1.) * ramp_fn(args.contrast_ramp)
     contrast_params = [contrast_low, contrast_high]
 
-    rnd_sat = torch.rand() * ramp_fn(args.rnd_sat_ramp) * args.rnd_sat
+    rnd_sat = torch.rand(1)[0] * ramp_fn(args.rnd_sat_ramp) * args.rnd_sat
 
     # blur
-    f = utils.random_blur_kernel(probs=[.25, .25], N_blur=7, sigrange_gauss=[1., 3.], sigrange_line=[.25, 1.], wmin_line=3)
-    encoded_image = F.conv2d(encoded_image, f, bias=None, padding=(1, 1))
+    N_blur=7
+    f = utils.random_blur_kernel(probs=[.25, .25], N_blur=N_blur, sigrange_gauss=[1., 3.], sigrange_line=[.25, 1.], wmin_line=3)
+    if args.cuda:
+        f = f.cuda()
+    encoded_image = F.conv2d(encoded_image, f, bias=None, padding=int((N_blur-1)/2))
 
     # noise
     noise = torch.normal(mean=0, std=rnd_noise, size=encoded_image.size(), dtype=torch.float32)
+    if args.cuda:
+        noise = noise.cuda()
     encoded_image = encoded_image + noise
     encoded_image =  torch.clamp(encoded_image, 0, 1)
 
     # contrast & brightness
     contrast_scale = torch.Tensor(encoded_image.size()[0]).uniform_(contrast_params[0], contrast_params[1])
     contrast_scale = contrast_scale.reshape(encoded_image.size()[0], 1, 1, 1)
-
+    if args.cuda:
+        contrast_scale = contrast_scale.cuda()
+        rnd_brightness = rnd_brightness.cuda()
     encoded_image = encoded_image * contrast_scale
     encoded_image = encoded_image + rnd_brightness
     encoded_image = torch.clamp(encoded_image, 0, 1)
 
     # saturation
-    encoded_image_lum = torch.mean(encoded_image * torch.FloatTensor([.3, .6, .1]).reshape(1, 3, 1, 1), dim=1).unsqueeze_(1)
+    sat_weight = torch.FloatTensor([.3, .6, .1]).reshape(1, 3, 1, 1)
+    if args.cuda:
+        sat_weight = sat_weight.cuda()
+    encoded_image_lum = torch.mean(encoded_image * sat_weight, dim=1).unsqueeze_(1)
     encoded_image = (1 - rnd_sat) * encoded_image + rnd_sat * encoded_image_lum
 
     # jpeg
     encoded_image = encoded_image.reshape([-1, 3, 400, 400])
     if not args.no_jpeg:
-        encoded_image = utils.jpeg_compress_decompress(encoded_image, rounding=utils.round_only_at_0, factor=jpeg_factor, downsample_c=True)
+        encoded_image = utils.jpeg_compress_decompress(encoded_image, rounding=utils.round_only_at_0, quality=jpeg_quality)
 
     return encoded_image
 
 
+def get_secret_acc(secret_true, secret_pred):
+    if 'cuda' in str(secret_pred.device):
+        secret_pred = secret_pred.cpu()
+        secret_true = secret_true.cpu()
+    secret_pred = torch.round(secret_pred)
+    correct_pred = torch.sum((secret_pred - secret_true) == 0, dim=1)
+    str_acc = 1.0 - torch.sum((correct_pred - secret_pred.size()[1]) != 0).numpy() / correct_pred.size()[0]
+    bit_acc = torch.sum(correct_pred).numpy() / secret_pred.numel()
+    return bit_acc, str_acc
+
+
 def build_model(encoder, decoder, discriminator, secret_input, image_input, l2_edge_gain, 
-                borders, secret_size, dst, rect, loss_scales, yuv_scales, args, global_step):
-    input_warped = torchvision.transforms.functional.perspective(image_input, dst, rect,interpolation=3)
-    mask_warped = torchvision.transforms.functional.perspective(torch.ones_like(input_warped), dst, rect,interpolation=3)
+                borders, secret_size, M, loss_scales, yuv_scales, args, global_step, writer):
+    test_transform = transform_net(image_input, args, global_step)
+
+    input_warped = torchgeometry.warp_perspective(image_input, M[:, 1, :, :], dsize=(400, 400), flags='bilinear')
+    mask_warped = torchgeometry.warp_perspective(torch.ones_like(input_warped), M[:, 1, :, :], dsize=(400, 400), flags='bilinear')
     input_warped += (1 - mask_warped) * image_input
 
     residual_warped = encoder((secret_input, input_warped))
     encoded_warped = residual_warped + input_warped
-    residual = torchvision.transforms.functional.perspective(residual_warped, rest, dst, interpolation=3)
+
+    residual = torchgeometry.warp_perspective(residual_warped, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
 
     if borders == 'no_edge':
         encoded_image = image_input + residual
     elif borders == 'black':
         encoded_image = residual_warped + input_warped
-        encoded_image = torchvision.transforms.functional.perspective(encoded_image, rect, dst, interpolation=3)
-        input_unwarped = torchvision.transforms.functional.perspective(input_warped, rect, dst, interpolation=3)
+        encoded_image = torchgeometry.warp_perspective(encoded_image, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
+        input_unwarped = torchgeometry.warp_perspective(image_input, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
     elif borders.startswith('random'):
-        mask = torchvision.transforms.functional.perspective(tf.ones_like(residual), rect, dst, interpolation=3)
-        encoded_image = residual_warped + input_warped
-        encoded_image = torchvision.transforms.functional.perspective(encoded_image, rect, dst, interpolation=3)
-        input_unwarped = torchvision.transforms.functional.perspective(input_warped, rect, dst, interpolation=3)
+        mask  = torchgeometry.warp_perspective(torch.ones_like(residual), M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
+        encoded_image = residual_warped + input_unwarped
+        encoded_image = torchgeometry.warp_perspective(encoded_image, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
+        input_unwarped = torchgeometry.warp_perspective(input_warped, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
         ch = 3 if borders.endswith('rgb') else 1
-        encoded_image += (1-mask) * torch.ones_like(residual) * torch.rand(ch,ch)
+        encoded_image += (1-mask) * torch.ones_like(residual) * torch.rand([ch])
     elif borders == 'white':
-        mask = torchvision.transforms.functional.perspective(tf.ones_like(residual), rect, dst, interpolation=3)
+        mask = torchgeometry.warp_perspective(torch.ones_like(residual), M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
         encoded_image = residual_warped + input_warped
-        encoded_image = torchvision.transforms.functional.perspective(encoded_image, rect, dst, interpolation=3)
-        input_unwarped = torchvision.transforms.functional.perspective(input_warped, rect, dst, interpolation=3)
-        encoded_image += (1-mask) * torch.ones_like(residual)
+        encoded_image = torchgeometry.warp_perspective(encoded_image, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
+        input_unwarped = torchgeometry.warp_perspective(input_warped, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
+        encoded_image += (1 - mask) * torch.ones_like(residual)
     elif borders == 'image':
-        mask = torchvision.transforms.functional.perspective(tf.ones_like(residual), rect, dst, interpolation=3)
+        mask = torchgeometry.warp_perspective(torch.ones_like(residual), M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
         encoded_image = residual_warped + input_warped
-        encoded_image = torchvision.transforms.functional.perspective(encoded_image, rect, dst, interpolation=3)
-        encoded_image += (1-mask) * torch.roll(image_input, 1, 0)
+        encoded_image = torchgeometry.warp_perspective(encoded_image, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
+        encoded_image += (1-mask) * torch.roll(image_input, 1, 0)        
 
     if borders == 'no_edge':
         D_output_real, _ = discriminator(image_input)
@@ -241,14 +265,19 @@ def build_model(encoder, decoder, discriminator, secret_input, image_input, l2_e
     else:
         D_output_real, _ = discriminator(input_warped)
         D_output_fake, D_heatmap = discriminator(encoded_warped)
-
-    transformed_image, transform_summaries = transform_net(encoded_image, args, global_step)
+        
+    transformed_image = transform_net(encoded_image, args, global_step)
     decoded_secret = decoder(transformed_image)
     bit_acc, str_acc = get_secret_acc(secret_input, decoded_secret)
-    lpips_loss = torch.mean(lpips_tf.lpips(image_input, encoded_image))
-    secret_loss = torch.nn.CrossEntropyLoss(secret_input, decoded_secret)
+    
+    lpips_loss = torch.mean(lpips(image_input, encoded_image))
 
-    size = (int(image_input.shape[1]), int(image_input.shape[2]))
+    cross_entropy = nn.BCELoss()
+    if args.cuda:
+        cross_entropy = cross_entropy.cuda()
+    secret_loss = cross_entropy(decoded_secret, secret_input)
+
+    size = (int(image_input.shape[2]), int(image_input.shape[3]))
     gain = 10
     falloff_speed = 4
     falloff_im = np.ones(size)
@@ -259,14 +288,19 @@ def build_model(encoder, decoder, discriminator, secret_input, image_input, l2_e
         falloff_im[:,-j] *= (np.cos(4*np.pi*j/size[0]+np.pi)+1)/2
         falloff_im[:,j] *= (np.cos(4*np.pi*j/size[0]+np.pi)+1)/2
     falloff_im = 1-falloff_im
-    falloff_im = torch.from_numpy(falloff_im, dtype=torch.float32)
+    falloff_im = torch.from_numpy(falloff_im).float()
+    if args.cuda:
+        falloff_im = falloff_im.cuda()
     falloff_im *= l2_edge_gain
 
-    encoded_image_yuv = colors.rgb_to_hsv(encoded_image)
-    image_input_yuv = colors.rgb_to_yuv(image_input)
+    encoded_image_yuv = color.rgb_to_yuv(encoded_image)
+    image_input_yuv = color.rgb_to_yuv(image_input)          
     im_diff = encoded_image_yuv - image_input_yuv
-    im_diff += im_diff * falloff_im.unsqueeze_()
-    yuv_loss = torch.mean((im_diff)**2, axis=[0, 1, 2])
+    im_diff += im_diff * falloff_im.unsqueeze_(0)
+    yuv_loss = torch.mean((im_diff)**2, axis=[0, 2, 3])
+    yuv_scales = torch.Tensor(yuv_scales)
+    if args.cuda:
+        yuv_scales = yuv_scales.cuda()
     image_loss = torch.dot(yuv_loss, yuv_scales)
 
     D_loss = D_output_real - D_output_fake
@@ -275,4 +309,21 @@ def build_model(encoder, decoder, discriminator, secret_input, image_input, l2_e
     if not args.no_gan:
         loss += loss_scales[3] * G_loss
 
-    return loss, secret_loss, D_loss, bit_acc
+    writer.add_scalar('loss/image_loss', image_loss, global_step)
+    writer.add_scalar('loss/lpips_loss', lpips_loss, global_step)
+    writer.add_scalar('loss/secret_loss', secret_loss, global_step)
+    writer.add_scalar('loss/G_loss', G_loss, global_step)
+    writer.add_scalar('loss/loss', loss, global_step)
+
+    writer.add_scalar('metric/bit_acc', bit_acc, global_step)
+    writer.add_scalar('metric/str_acc', str_acc, global_step)
+    if global_step % 20 == 0:
+        writer.add_image('input/image_input', image_input[0], global_step)
+        writer.add_image('input/image_warped', input_warped[0], global_step)
+        writer.add_image('encoded/encoded_warped', encoded_warped[0], global_step)
+        writer.add_image('encoded/residual_warped', residual_warped[0] + 0.5, global_step)
+        writer.add_image('encoded/encoded_image', encoded_image[0], global_step)
+        writer.add_image('transformed/transformed_image', transformed_image[0], global_step)
+        writer.add_image('transformed/test', test_transform[0], global_step)
+
+    return loss, secret_loss, D_loss, bit_acc, str_acc

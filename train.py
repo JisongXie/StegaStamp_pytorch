@@ -1,3 +1,4 @@
+
 import os
 import yaml
 import random
@@ -7,8 +8,12 @@ from glob import glob
 from easydict import EasyDict
 from PIL import Image, ImageOps
 from torch import optim
+
+import utils
 from dataset import StegaData
 from torch.utils.data import DataLoader
+from tensorboardX import SummaryWriter
+
 
 with open('cfg\setting.yaml', 'r') as f:
     args = EasyDict(yaml.load(f, Loader=yaml.SafeLoader))
@@ -16,28 +21,42 @@ with open('cfg\setting.yaml', 'r') as f:
 if not os.path.exists(args.checkpoints_path):
     os.makedirs(args.checkpoints_path)
 
+
 def main():
+    log_path = os.path.join(args.logs_path, str(args.exp_name))
+    writer = SummaryWriter(logdir=log_path)
 
     dataset = StegaData(args.train_path, args.secret_size, size=(400, 400))
-    dataloader = DataLoader(datase, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
 
     encoder = model.StegaStampEncoder()
-    decoder = model.StegaStampDecoder(args.secret_size=100)
+    decoder = model.StegaStampDecoder(secret_size=args.secret_size)
     discriminator = model.Discriminator()
-    model.build_model()
+    if args.cuda:
+        encoder = encoder.cuda()
+        decoder = decoder.cuda()
+        discriminator = discriminator.cuda()
 
     d_vars = discriminator.parameters()
-    g_vars = [encoder.parameters(), decoder.parameters()]
+    g_vars = [{'params': encoder.parameters()},
+              {'params': decoder.parameters()}]
  
     optimize_loss = optim.Adam(g_vars, lr=args.lr)
     optimize_secret_loss = optim.Adam(g_vars, lr=args.lr)
     optimize_dis = optim.RMSprop(d_vars, lr=0.00001)
 
-    total_steps = len(StegaData) // args.batch_size + 1
+    height = 400
+    width = 400
+
+    total_steps = len(dataset) // args.batch_size + 1
     global_step = 0
 
     while global_step < args.num_steps:
         for _ in range(min(total_steps, args.num_steps - global_step)):
+            image_input, secret_input = next(iter(dataloader))
+            if args.cuda:
+                image_input = image_input.cuda()
+                secret_input = secret_input.cuda()
             no_im_loss = global_step < args.no_im_loss_steps
             l2_loss_scale = min(args.l2_loss_scale * global_step / args.l2_loss_ramp, args.l2_loss_scale)
             lpips_loss_scale = min(args.lpips_loss_scale * global_step / args.lpips_loss_ramp, args.lpips_loss_scale)
@@ -51,10 +70,14 @@ def main():
             rnd_tran = np.random.uniform() * rnd_tran
             
             global_step += 1
-            dst, rect = utils.get_rand_transform_matrix(width, np.floor(width * rnd_tran), args.batch_size)
-            
-            loss, secret_loss, D_loss, bit_acc = build_model(encoder, decoder, discriminator, secret_input, image_input, l2_edge_gain, 
-                    borders, secret_size, dst, rect, loss_scales, yuv_scales, args, global_step)
+            Ms = utils.get_rand_transform_matrix(width, np.floor(width * rnd_tran), args.batch_size)
+            if args.cuda:
+                Ms = Ms.cuda()
+
+            loss_scales = [l2_loss_scale, lpips_loss_scale, secret_loss_scale, G_loss_scale]
+            yuv_scales = [args.y_scale, args.u_scale, args.v_scale]
+            loss, secret_loss, D_loss, bit_acc, str_acc = model.build_model(encoder, decoder, discriminator, secret_input, image_input, args.l2_edge_gain, 
+                    args.borders, args.secret_size, Ms, loss_scales, yuv_scales, args, global_step, writer)
             if no_im_loss:
                 optimize_secret_loss.zero_grad()
                 secret_loss.backward()
@@ -67,6 +90,9 @@ def main():
                     optimize_dis.zero_grad()
                     optimize_dis.step()
             
-            if global_step % 10 == 0:
-                print('Loss = {:.4f}'.format(loss))
-            
+            # if global_step % 10 == 0:
+            print('Loss = {:.4f}'.format(loss))
+    writer.close()
+
+if __name__ == '__main__':
+    main()
