@@ -1,4 +1,5 @@
 import sys
+
 sys.path.append("PerceptualSimilarity\\")
 import os
 import utils
@@ -9,7 +10,6 @@ import torchgeometry
 from kornia import color
 import torch.nn.functional as F
 from torchvision import transforms
-from PerceptualSimilarity.lpips_torch import lpips
 
 
 class Dense(nn.Module):
@@ -44,7 +44,7 @@ class Conv2D(nn.Module):
         self.activation = activation
         self.strides = strides
 
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, strides, int((kernel_size-1)/2))
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, strides, int((kernel_size - 1) / 2))
         # default: using he_normal as the kernel initializer
         nn.init.kaiming_normal_(self.conv.weight)
 
@@ -56,6 +56,14 @@ class Conv2D(nn.Module):
             else:
                 raise NotImplementedError
         return outputs
+
+
+class Flatten(nn.Module):
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, input):
+        return input.view(input.size(0), -1)
 
 
 class StegaStampEncoder(nn.Module):
@@ -77,7 +85,7 @@ class StegaStampEncoder(nn.Module):
         self.up9 = Conv2D(32, 32, 3, activation='relu')
         self.conv9 = Conv2D(70, 32, 3, activation='relu')
         self.residual = Conv2D(32, 3, 1, activation=None)
-    
+
     def forward(self, inputs):
         secrect, image = inputs
         secrect = secrect - .5
@@ -109,18 +117,33 @@ class StegaStampEncoder(nn.Module):
         return residual
 
 
-class Flatten(nn.Module):
+class SpatialTransformerNetwork(nn.Module):
     def __init__(self):
-        super(Flatten, self).__init__()
+        super(SpatialTransformerNetwork, self).__init__()
+        self.localization = nn.Sequential(
+            Conv2D(3, 32, 3, strides=2, activation='relu'),
+            Conv2D(32, 64, 3, strides=2, activation='relu'),
+            Conv2D(64, 128, 3, strides=2, activation='relu'),
+            Flatten(),
+            Dense(320000, 128, activation='relu'),
+            nn.Linear(128, 6)
+        )
+        self.localization[-1].weight.data.fill_(0)
+        self.localization[-1].bias.data = torch.FloatTensor([1, 0, 0, 0, 1, 0])
 
-    def forward(self, input):
-        return input.view(input.size(0), -1)
+    def forward(self, image):
+        theta = self.localization(image)
+        theta = theta.view(-1, 2, 3)
+        grid = F.affine_grid(theta, image.size(), align_corners=False)
+        transformed_image = F.grid_sample(image, grid, align_corners=False)
+        return transformed_image
 
 
 class StegaStampDecoder(nn.Module):
     def __init__(self, secret_size=100):
         super(StegaStampDecoder, self).__init__()
         self.secret_size = secret_size
+        self.stn = SpatialTransformerNetwork()
         self.decoder = nn.Sequential(
             Conv2D(3, 32, 3, strides=2, activation='relu'),
             Conv2D(32, 32, 3, activation='relu'),
@@ -135,7 +158,8 @@ class StegaStampDecoder(nn.Module):
 
     def forward(self, image):
         image = image - .5
-        return torch.sigmoid(self.decoder(image))
+        transformed_image = self.stn(image)
+        return torch.sigmoid(self.decoder(transformed_image))
 
 
 class Discriminator(nn.Module):
@@ -147,7 +171,7 @@ class Discriminator(nn.Module):
             Conv2D(16, 32, 3, strides=2, activation='relu'),
             Conv2D(32, 64, 3, strides=2, activation='relu'),
             Conv2D(64, 1, 3, activation=None))
-    
+
     def forward(self, image):
         x = image - .5
         x = self.model(x)
@@ -166,24 +190,25 @@ def transform_net(encoded_image, args, global_step):
     rnd_noise = torch.rand(1)[0] * ramp_fn(args.rnd_noise_ramp) * args.rnd_noise
 
     contrast_low = 1. - (1. - args.contrast_low) * ramp_fn(args.contrast_ramp)
-    contrast_high = 1. + (args.contrast_high -  1.) * ramp_fn(args.contrast_ramp)
+    contrast_high = 1. + (args.contrast_high - 1.) * ramp_fn(args.contrast_ramp)
     contrast_params = [contrast_low, contrast_high]
 
     rnd_sat = torch.rand(1)[0] * ramp_fn(args.rnd_sat_ramp) * args.rnd_sat
 
     # blur
-    N_blur=7
-    f = utils.random_blur_kernel(probs=[.25, .25], N_blur=N_blur, sigrange_gauss=[1., 3.], sigrange_line=[.25, 1.], wmin_line=3)
+    N_blur = 7
+    f = utils.random_blur_kernel(probs=[.25, .25], N_blur=N_blur, sigrange_gauss=[1., 3.], sigrange_line=[.25, 1.],
+                                 wmin_line=3)
     if args.cuda:
         f = f.cuda()
-    encoded_image = F.conv2d(encoded_image, f, bias=None, padding=int((N_blur-1)/2))
+    encoded_image = F.conv2d(encoded_image, f, bias=None, padding=int((N_blur - 1) / 2))
 
     # noise
     noise = torch.normal(mean=0, std=rnd_noise, size=encoded_image.size(), dtype=torch.float32)
     if args.cuda:
         noise = noise.cuda()
     encoded_image = encoded_image + noise
-    encoded_image =  torch.clamp(encoded_image, 0, 1)
+    encoded_image = torch.clamp(encoded_image, 0, 1)
 
     # contrast & brightness
     contrast_scale = torch.Tensor(encoded_image.size()[0]).uniform_(contrast_params[0], contrast_params[1])
@@ -205,7 +230,8 @@ def transform_net(encoded_image, args, global_step):
     # jpeg
     encoded_image = encoded_image.reshape([-1, 3, 400, 400])
     if not args.no_jpeg:
-        encoded_image = utils.jpeg_compress_decompress(encoded_image, rounding=utils.round_only_at_0, quality=jpeg_quality)
+        encoded_image = utils.jpeg_compress_decompress(encoded_image, rounding=utils.round_only_at_0,
+                                                       quality=jpeg_quality)
 
     return encoded_image
 
@@ -221,12 +247,13 @@ def get_secret_acc(secret_true, secret_pred):
     return bit_acc, str_acc
 
 
-def build_model(encoder, decoder, discriminator, secret_input, image_input, l2_edge_gain, 
+def build_model(encoder, decoder, discriminator, lpips_fn, secret_input, image_input, l2_edge_gain,
                 borders, secret_size, M, loss_scales, yuv_scales, args, global_step, writer):
     test_transform = transform_net(image_input, args, global_step)
 
     input_warped = torchgeometry.warp_perspective(image_input, M[:, 1, :, :], dsize=(400, 400), flags='bilinear')
-    mask_warped = torchgeometry.warp_perspective(torch.ones_like(input_warped), M[:, 1, :, :], dsize=(400, 400), flags='bilinear')
+    mask_warped = torchgeometry.warp_perspective(torch.ones_like(input_warped), M[:, 1, :, :], dsize=(400, 400),
+                                                 flags='bilinear')
     input_warped += (1 - mask_warped) * image_input
 
     residual_warped = encoder((secret_input, input_warped))
@@ -241,23 +268,26 @@ def build_model(encoder, decoder, discriminator, secret_input, image_input, l2_e
         encoded_image = torchgeometry.warp_perspective(encoded_image, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
         input_unwarped = torchgeometry.warp_perspective(image_input, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
     elif borders.startswith('random'):
-        mask  = torchgeometry.warp_perspective(torch.ones_like(residual), M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
+        mask = torchgeometry.warp_perspective(torch.ones_like(residual), M[:, 0, :, :], dsize=(400, 400),
+                                              flags='bilinear')
         encoded_image = residual_warped + input_unwarped
         encoded_image = torchgeometry.warp_perspective(encoded_image, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
         input_unwarped = torchgeometry.warp_perspective(input_warped, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
         ch = 3 if borders.endswith('rgb') else 1
-        encoded_image += (1-mask) * torch.ones_like(residual) * torch.rand([ch])
+        encoded_image += (1 - mask) * torch.ones_like(residual) * torch.rand([ch])
     elif borders == 'white':
-        mask = torchgeometry.warp_perspective(torch.ones_like(residual), M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
+        mask = torchgeometry.warp_perspective(torch.ones_like(residual), M[:, 0, :, :], dsize=(400, 400),
+                                              flags='bilinear')
         encoded_image = residual_warped + input_warped
         encoded_image = torchgeometry.warp_perspective(encoded_image, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
         input_unwarped = torchgeometry.warp_perspective(input_warped, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
         encoded_image += (1 - mask) * torch.ones_like(residual)
     elif borders == 'image':
-        mask = torchgeometry.warp_perspective(torch.ones_like(residual), M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
+        mask = torchgeometry.warp_perspective(torch.ones_like(residual), M[:, 0, :, :], dsize=(400, 400),
+                                              flags='bilinear')
         encoded_image = residual_warped + input_warped
         encoded_image = torchgeometry.warp_perspective(encoded_image, M[:, 0, :, :], dsize=(400, 400), flags='bilinear')
-        encoded_image += (1-mask) * torch.roll(image_input, 1, 0)        
+        encoded_image += (1 - mask) * torch.roll(image_input, 1, 0)
 
     if borders == 'no_edge':
         D_output_real, _ = discriminator(image_input)
@@ -265,12 +295,14 @@ def build_model(encoder, decoder, discriminator, secret_input, image_input, l2_e
     else:
         D_output_real, _ = discriminator(input_warped)
         D_output_fake, D_heatmap = discriminator(encoded_warped)
-        
+
     transformed_image = transform_net(encoded_image, args, global_step)
     decoded_secret = decoder(transformed_image)
     bit_acc, str_acc = get_secret_acc(secret_input, decoded_secret)
-    
-    lpips_loss = torch.mean(lpips(image_input, encoded_image))
+
+    normalized_input = image_input * 2 - 1
+    normalized_encoded = encoded_image * 2 - 1
+    lpips_loss = torch.mean(lpips_fn(normalized_input, normalized_encoded))
 
     cross_entropy = nn.BCELoss()
     if args.cuda:
@@ -281,23 +313,23 @@ def build_model(encoder, decoder, discriminator, secret_input, image_input, l2_e
     gain = 10
     falloff_speed = 4
     falloff_im = np.ones(size)
-    for i in range(int(falloff_im.shape[0]/falloff_speed)): #for i in range 100
-        falloff_im[-i,:] *= (np.cos(4*np.pi*i/size[0]+np.pi)+1)/2# [cos[(4*pi*i/400)+pi] + 1]/2
-        falloff_im[i,:] *= (np.cos(4*np.pi*i/size[0]+np.pi)+1)/2 # [cos[(4*pi*i/400)+pi] + 1]/2
-    for j in range(int(falloff_im.shape[1]/falloff_speed)):
-        falloff_im[:,-j] *= (np.cos(4*np.pi*j/size[0]+np.pi)+1)/2
-        falloff_im[:,j] *= (np.cos(4*np.pi*j/size[0]+np.pi)+1)/2
-    falloff_im = 1-falloff_im
+    for i in range(int(falloff_im.shape[0] / falloff_speed)):  # for i in range 100
+        falloff_im[-i, :] *= (np.cos(4 * np.pi * i / size[0] + np.pi) + 1) / 2  # [cos[(4*pi*i/400)+pi] + 1]/2
+        falloff_im[i, :] *= (np.cos(4 * np.pi * i / size[0] + np.pi) + 1) / 2  # [cos[(4*pi*i/400)+pi] + 1]/2
+    for j in range(int(falloff_im.shape[1] / falloff_speed)):
+        falloff_im[:, -j] *= (np.cos(4 * np.pi * j / size[0] + np.pi) + 1) / 2
+        falloff_im[:, j] *= (np.cos(4 * np.pi * j / size[0] + np.pi) + 1) / 2
+    falloff_im = 1 - falloff_im
     falloff_im = torch.from_numpy(falloff_im).float()
     if args.cuda:
         falloff_im = falloff_im.cuda()
     falloff_im *= l2_edge_gain
 
     encoded_image_yuv = color.rgb_to_yuv(encoded_image)
-    image_input_yuv = color.rgb_to_yuv(image_input)          
+    image_input_yuv = color.rgb_to_yuv(image_input)
     im_diff = encoded_image_yuv - image_input_yuv
     im_diff += im_diff * falloff_im.unsqueeze_(0)
-    yuv_loss = torch.mean((im_diff)**2, axis=[0, 2, 3])
+    yuv_loss = torch.mean((im_diff) ** 2, axis=[0, 2, 3])
     yuv_scales = torch.Tensor(yuv_scales)
     if args.cuda:
         yuv_scales = yuv_scales.cuda()
