@@ -1,5 +1,8 @@
 /__pycache__/
 /logs/
+/images
+/saved_models
+/checkpoints
 *.png
 *.jpg
 /PerceptualSimilarity/
